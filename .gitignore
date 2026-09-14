@@ -1,0 +1,34 @@
+# Build output and local experiments
+/.build/
+/dist/
+/assets/concepts/
+*.app/
+*.dSYM/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials, state, diagnostics and transcripts
+.env
+.env.*
+!.env.example
+.codex/
+.codex-workers/
+auth.json
+config.toml
+runtime.json
+settings.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.jsonl
+*.log
+*.pem
+*.key
