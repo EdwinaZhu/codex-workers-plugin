@@ -6,3 +6,4 @@
 *.json text eol=lf
 *.plist text eol=lf
 *.png binary
+*.gif binary

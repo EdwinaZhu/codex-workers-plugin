@@ -22,6 +22,7 @@ bash scripts/check.sh
 
 ```sh
 "dist/Codex Workers.app/Contents/MacOS/CodexWorkers" --render-preview assets/preview.png
+"dist/Codex Workers.app/Contents/MacOS/CodexWorkers" --render-animation assets/preview.gif
 ```
 
 提交后打包源码：

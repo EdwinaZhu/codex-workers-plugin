@@ -4,7 +4,7 @@
 
 A Codex plugin for Codexholics who keep several tasks running at once. Each active task becomes a tiny pixel worker on your desktop, so you can see who's working and who's finished at a glance.
 
-![Workers working, cheering and sleeping](assets/preview.png)
+![Workers working, cheering and sleeping](assets/preview.gif)
 
 ## Get started
 

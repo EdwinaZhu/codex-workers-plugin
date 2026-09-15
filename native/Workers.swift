@@ -1,4 +1,5 @@
 import Cocoa
+import ImageIO
 
 struct Worker: Decodable {
     var id: String
@@ -54,23 +55,97 @@ enum WorkerPose: String, CaseIterable {
     }
 }
 
-// Load the exact approved transparent PNGs once; no regeneration or recoloring.
+struct WorkerSprites {
+    let body: NSImage
+    let foreground: NSImage
+    let sleepZ: NSImage?
+    let size: NSSize
+    let foregroundTop: CGFloat
+}
+
+// The six approved helmet colors. Session IDs already supply a stable random-looking index.
 enum WorkerArtwork {
-    static let images: [WorkerPose:NSImage] = {
-        var result: [WorkerPose:NSImage] = [:]
+    static let palette: [(hue:CGFloat,saturation:CGFloat)] = [
+        (0.50,1), (0.57,0.78), (0.74,0.60), (0.94,0.57), (0.13,0.80), (0.34,0.68)
+    ]
+    static let sources: [WorkerPose:Data] = {
+        var result: [WorkerPose:Data] = [:]
         for pose in WorkerPose.allCases {
             guard let url = Bundle.main.url(forResource:pose.rawValue,withExtension:"png",subdirectory:"Workers"),
                   let data = try? Data(contentsOf:url), let bitmap = NSBitmapImageRep(data:data),
-                  bitmap.hasAlpha else { continue }
-            let size = NSSize(width:bitmap.pixelsWide,height:bitmap.pixelsHigh)
-            bitmap.size = size
-            let image = NSImage(size:size); image.addRepresentation(bitmap)
-            result[pose] = image
+                  bitmap.hasAlpha, bitmap.pixelsWide == 340, bitmap.pixelsHigh == 360,
+                  bitmap.bitsPerPixel == 32, bitmap.bitsPerSample == 8, !bitmap.isPlanar else { continue }
+            result[pose] = data
         }
         return result
     }()
+    static var cache: [WorkerPose:[Int:WorkerSprites]] = [:]
     static var errorMessage:String? {
-        images.count == WorkerPose.allCases.count ? nil : "工人透明素材缺失，请重新安装本机应用"
+        sources.count == WorkerPose.allCases.count ? nil : "工人透明素材缺失，请重新安装本机应用"
+    }
+    static func sprites(for worker:Worker) -> WorkerSprites? {
+        let pose = WorkerPose(worker)
+        let index = (worker.color % palette.count + palette.count) % palette.count
+        if let cached = cache[pose]?[index] { return cached }
+        guard let data = sources[pose], let bitmap = NSBitmapImageRep(data:data) else { return nil }
+        let helmetBottom = pose == .working ? 180 : (pose == .cheering ? 144 : 212)
+        if index > 0 {
+            let target = palette[index]
+            for y in 0..<helmetBottom { for x in 0..<bitmap.pixelsWide {
+                if pose == .sleeping && x >= 250 && y < 90 { continue }
+                guard let color = bitmap.colorAt(x:x,y:y)?.usingColorSpace(.deviceRGB), color.alphaComponent > 0 else { continue }
+                var h:CGFloat = 0, s:CGFloat = 0, v:CGFloat = 0, a:CGFloat = 0
+                color.getHue(&h,saturation:&s,brightness:&v,alpha:&a)
+                guard (0.44...0.59).contains(h), s > 0.35, v > 0.18 else { continue }
+                let hue = (target.hue + (h-0.5)*0.4 + 1).truncatingRemainder(dividingBy:1)
+                bitmap.setColor(NSColor(deviceHue:hue,saturation:s*target.saturation,brightness:v,alpha:a),atX:x,y:y)
+            } }
+        }
+        func crop(_ rect:CGRect) -> NSImage {
+            NSImage(cgImage:bitmap.cgImage!.cropping(to:rect)!,size:rect.size)
+        }
+        var sleepZ:NSImage?
+        if pose == .sleeping {
+            let original = NSBitmapImageRep(data:data)!
+            sleepZ = NSImage(cgImage:original.cgImage!.cropping(to:CGRect(x:250,y:0,width:90,height:90))!,
+                            size:NSSize(width:90,height:90))
+            // Remove the Z from the body layer so it can float independently.
+            for y in 0..<90 { memset(bitmap.bitmapData! + y*bitmap.bytesPerRow + 250*4,0,90*4) }
+        }
+        let top:CGFloat = pose == .sleeping ? 248 : 238
+        let sprites = WorkerSprites(body:crop(CGRect(x:0,y:0,width:340,height:top)),
+            foreground:crop(CGRect(x:0,y:top,width:340,height:360-top)),sleepZ:sleepZ,
+            size:NSSize(width:340,height:360),foregroundTop:top)
+        cache[pose,default:[:]][index] = sprites
+        return sprites
+    }
+}
+
+struct WorkerMotion: Equatable {
+    var bodyY: CGFloat = 0
+    var bodyScale: CGFloat = 1
+    var zY: CGFloat = 0
+    var zOpacity: CGFloat = 1
+    static func enabled(_ worker:Worker) -> Bool {
+        worker.status == "done" || worker.status == "idle" || (worker.status == "working" && worker.active)
+    }
+    static func sample(_ worker:Worker, time:TimeInterval, reduceMotion:Bool) -> WorkerMotion {
+        guard !reduceMotion, enabled(worker) else { return WorkerMotion() }
+        let seed = worker.id.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }
+        let t = time + Double(seed % 4800)/1000
+        switch WorkerPose(worker) {
+        case .working:
+            let nod = CGFloat((1-cos(t/1.2 * 2 * .pi))/2)
+            return WorkerMotion(bodyY:0.6*nod,bodyScale:1-0.025*nod)
+        case .cheering:
+            let hop = CGFloat(pow(max(0,sin(t/1.6 * 2 * .pi)),2))
+            return WorkerMotion(bodyY:-1.8*hop)
+        case .sleeping:
+            let phase = t.truncatingRemainder(dividingBy:4.8)/4.8
+            let breath = CGFloat(sin(phase*2 * .pi))
+            return WorkerMotion(bodyY:0.2*breath,bodyScale:1+0.018*breath,
+                                zY:-2*CGFloat(phase),zOpacity:CGFloat(pow(sin(phase * .pi),2)))
+        }
     }
 }
 
@@ -92,6 +167,8 @@ func rounded(_ rect: NSRect, radius: CGFloat, color: NSColor) {
 
 final class PetView: NSView {
     var worker: Worker
+    var animationTime: TimeInterval = 0
+    var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     var pressedAt: NSPoint?
     var originalOrigin: NSPoint?
     var moved = false
@@ -145,14 +222,28 @@ final class PetView: NSView {
         defer { NSGraphicsContext.restoreGraphicsState() }
         graphics.cgContext.clear(bounds)
         graphics.imageInterpolation = .none
-        if let image = WorkerArtwork.images[WorkerPose(worker)] {
-            let factor = min(bounds.width/image.size.width,bounds.height/image.size.height)
-            let size = NSSize(width:image.size.width*factor,height:image.size.height*factor)
+        NSBezierPath(rect:bounds).addClip()
+        if let sprites = WorkerArtwork.sprites(for:worker) {
+            let factor = min(bounds.width/sprites.size.width,bounds.height/sprites.size.height)
+            let size = NSSize(width:sprites.size.width*factor,height:sprites.size.height*factor)
             let rect = NSRect(x:(bounds.width-size.width)/2,y:(bounds.height-size.height)/2,
                               width:size.width,height:size.height)
-            image.draw(in:rect,from:.zero,operation:.sourceOver,
-                       fraction:worker.status == "unknown" ? 0.42 : 1,
-                       respectFlipped:true,hints:nil)
+            let motion = WorkerMotion.sample(worker,time:animationTime,reduceMotion:reduceMotion)
+            let unit = bounds.width/48
+            let bodyHeight = sprites.foregroundTop*factor
+            let alpha:CGFloat = worker.status == "unknown" ? 0.42 : 1
+            func draw(_ image:NSImage, _ target:NSRect, opacity:CGFloat = 1) {
+                image.draw(in:target,from:.zero,operation:.sourceOver,fraction:alpha*opacity,
+                           respectFlipped:true,hints:nil)
+            }
+            draw(sprites.body,NSRect(x:rect.minX,y:rect.minY+bodyHeight*(1-motion.bodyScale)+motion.bodyY*unit,
+                                     width:rect.width,height:bodyHeight*motion.bodyScale))
+            draw(sprites.foreground,NSRect(x:rect.minX,y:rect.minY+bodyHeight,
+                                           width:rect.width,height:rect.height-bodyHeight))
+            if let z = sprites.sleepZ {
+                draw(z,NSRect(x:rect.minX+250*factor,y:rect.minY+motion.zY*unit,
+                              width:90*factor,height:90*factor),opacity:motion.zOpacity)
+            }
         }
         if worker.status == "waiting" || worker.status == "error" {
             (worker.status == "waiting" ? NSColor.systemOrange : NSColor.systemRed).setFill()
@@ -280,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.imagePosition = .imageLeading
         refreshMenu()
         startCollector()
-        timer = Timer.scheduledTimer(withTimeInterval:0.20, repeats:true) { [weak self] _ in self?.tick() }
+        timer = Timer.scheduledTimer(withTimeInterval:0.10, repeats:true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode:.common)
     }
     func startCollector() {
@@ -355,7 +446,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "loginStartupEnabled": loginStartupEnabled,
             "layout": "single-panel-grid",
             "appearance": "transparent-workstations",
-            "loadedSpriteCount": WorkerArtwork.images.count,
+            "loadedSpriteCount": WorkerArtwork.sources.count,
+            "hatColorCount": WorkerArtwork.palette.count,
+            "animation": "pose-motion",
+            "reduceMotion": NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
             "tileWidth": Double(tileSide),
             "tileHeight": Double(tileSide),
             "windowWidth": panel.frame.width,
@@ -405,6 +499,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         frame += 1
         let now = Date().timeIntervalSince1970
         let stale = now - latestAt > 8
+        let animationTime = ProcessInfo.processInfo.systemUptime
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         var removed = false
         for id in Array(pets.keys) {
             guard let pet = pets[id] else { continue }
@@ -413,12 +509,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 disconnected.active = false; disconnected.status = "unknown"; disconnected.label = "连接已离开"
                 pet.view.update(disconnected)
             }
+            if panel.isVisible && !hidden {
+                let changed = pet.view.reduceMotion != reduceMotion
+                pet.view.reduceMotion = reduceMotion
+                if changed || (!reduceMotion && WorkerMotion.enabled(pet.view.worker)) {
+                    pet.view.animationTime = animationTime
+                    pet.view.needsDisplay = true
+                }
+            }
             if !pet.view.worker.active && now >= pet.view.worker.expiresAt {
                 removePet(id); removed = true
             }
         }
         if removed { layoutGroup(); writeDiagnostics() }
-        if removed || frame % 25 == 0 { refreshMenu() }
+        if removed || frame % 50 == 0 { refreshMenu() }
     }
     func refreshMenu() {
         guard statusItem != nil else { return }
@@ -593,6 +697,45 @@ func smokeTest() {
         renderedStates.insert(bitmap.representation(using:.png,properties:[:])!)
     }
     precondition(renderedStates.count == 3)
+    // Palette changes affect the helmet, not the monitor/desk or the sleep Z.
+    func pixels(_ bitmap:NSBitmapImageRep, from row:Int) -> Data {
+        Data(bytes:bitmap.bitmapData! + row*bitmap.bytesPerRow,
+             count:(bitmap.pixelsHigh-row)*bitmap.bytesPerRow)
+    }
+    for (status,active) in [("working",true),("done",false),("idle",false)] {
+        var colors = Set<Data>(), foregrounds = Set<Data>(), symbols = Set<Data>()
+        for color in 0..<6 {
+            var worker = fixture(0,status:status,active:active); worker.color = color
+            stateView.update(worker); stateView.reduceMotion = true
+            let bitmap = workerBitmap(stateView,pixels:96)
+            colors.insert(bitmap.representation(using:.png,properties:[:])!)
+            foregrounds.insert(pixels(bitmap,from:72))
+            if let z = WorkerArtwork.sprites(for:worker)!.sleepZ { symbols.insert(z.tiffRepresentation!) }
+            precondition(WorkerArtwork.sprites(for:worker)!.body === WorkerArtwork.sprites(for:worker)!.body)
+        }
+        precondition(colors.count == 6 && foregrounds.count == 1)
+        if status == "idle" { precondition(symbols.count == 1) }
+        stateView.update(fixture(0,status:status,active:active)); stateView.reduceMotion = false
+        var frames = Set<Data>(), desks = Set<Data>()
+        for time in [0.0,0.3,0.6,0.9] {
+            stateView.animationTime = time
+            let bitmap = workerBitmap(stateView,pixels:96)
+            frames.insert(bitmap.representation(using:.png,properties:[:])!)
+            desks.insert(pixels(bitmap,from:72))
+            precondition(bitmap.colorAt(x:0,y:0)!.alphaComponent == 0)
+        }
+        precondition(frames.count > 1 && desks.count == 1)
+        stateView.reduceMotion = true
+        stateView.animationTime = 0
+        let still = workerBitmap(stateView,pixels:96).representation(using:.png,properties:[:])!
+        stateView.animationTime = 1
+        precondition(still == workerBitmap(stateView,pixels:96).representation(using:.png,properties:[:])!)
+    }
+    for status in ["waiting","error","unknown"] {
+        let worker = fixture(0,status:status,active:false)
+        precondition(WorkerMotion.sample(worker,time:1,reduceMotion:false) == WorkerMotion())
+    }
+    stateView.reduceMotion = false
     stateView.update(workers[0])
     // Every tile invokes the same group movement, preserving all local offsets.
     let positions = delegate.order.map { delegate.pets[$0]!.view.frame }
@@ -645,7 +788,7 @@ func smokeTest() {
     checkGrid(workers.map(\.id))
     apply([]); checkGrid([])
     delegate.panel.close()
-    print("Native smoke test passed: bundled transparent artwork, three distinct rendered states, alpha-preserving tiles, shared panel, group dragging, reflow, sizes, screen bounds and TTL cleanup.")
+    print("Native smoke test passed: six cached helmet colors, three animated states, fixed desks and sleep-Z colors, Reduce Motion, transparency, shared panel, group dragging, reflow, sizes, screen bounds and TTL cleanup.")
 }
 
 func workerBitmap(_ view:PetView, pixels:Int) -> NSBitmapImageRep {
@@ -657,45 +800,69 @@ func workerBitmap(_ view:PetView, pixels:Int) -> NSBitmapImageRep {
     return bitmap
 }
 
-func drawSample(_ worker:Worker, in rect:NSRect) {
+func drawSample(_ worker:Worker, in rect:NSRect, time:TimeInterval = 0) {
     let view = PetView(worker:worker)
+    view.animationTime = time; view.reduceMotion = false
     let bitmap = workerBitmap(view,pixels:max(96,Int(rect.width*2)))
     let sprite = NSImage(size:view.bounds.size); sprite.addRepresentation(bitmap)
     sprite.draw(in:rect,from:.zero,operation:.sourceOver,fraction:1)
 }
 
 // Only synthetic examples, rendered locally with the production drawing code.
-func renderPreview(_ path:String) {
+func previewImage(time:TimeInterval = 0) -> NSImage {
     let size = NSSize(width:600,height:340)
     let image = NSImage(size:size); image.lockFocus()
     NSColor(red:0.90,green:0.92,blue:0.91,alpha:1).setFill()
     NSRect(origin:.zero,size:size).fill()
     text("工人小队 · 透明工位",NSRect(x:28,y:295,width:544,height:25),size:18,color:ink,weight:.semibold)
-    text("透明背景 · 每格 48 × 48 · 拖动整组",NSRect(x:28,y:273,width:544,height:18),size:11,color:ink.withAlphaComponent(0.7))
+    text("彩色工帽 · 轻量动态 · 每格 48 × 48",NSRect(x:28,y:273,width:544,height:18),size:11,color:ink.withAlphaComponent(0.7))
     let states = [("working",true,"低头 · 工作"),("done",false,"举手 · 欢呼"),("idle",false,"趴桌 · 睡眠")]
     for (index,state) in states.enumerated() {
         let worker = fixture(index,status:state.0,active:state.1)
-        drawSample(worker,in:NSRect(x:CGFloat(index)*96+28,y:139,width:96,height:96))
+        drawSample(worker,in:NSRect(x:CGFloat(index)*96+28,y:139,width:96,height:96),time:time)
         text(state.2,NSRect(x:CGFloat(index)*96+24,y:110,width:104,height:18),size:11,color:ink)
     }
     text("三种姿态 · 放大预览",NSRect(x:28,y:80,width:288,height:18),size:10,color:ink.withAlphaComponent(0.55))
     for index in 0..<8 {
         let state = states[index % states.count]
         drawSample(fixture(index,status:state.0,active:state.1),
-                   in:NSRect(x:364+CGFloat(index%4)*48,y:139+CGFloat(1-index/4)*48,width:48,height:48))
+                   in:NSRect(x:364+CGFloat(index%4)*48,y:139+CGFloat(1-index/4)*48,width:48,height:48),time:time)
     }
     text("紧凑方格 · 自动补位",NSRect(x:354,y:110,width:212,height:18),size:11,color:ink)
     text("悬停看任务名称 · 点击看详情",NSRect(x:28,y:27,width:544,height:18),size:11,color:ink.withAlphaComponent(0.7))
     image.unlockFocus()
+    return image
+}
+
+func renderPreview(_ path:String) {
+    let image = previewImage()
     guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data:tiff),
           let png = rep.representation(using:.png,properties:[:]) else { return }
     do { try png.write(to:URL(fileURLWithPath:path)) }
     catch { fatalError("Cannot save preview: \(error)") }
 }
 
+func renderAnimation(_ path:String) {
+    guard let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath:path) as CFURL,
+        "com.compuserve.gif" as CFString,48,nil) else { fatalError("Cannot create animation preview") }
+    CGImageDestinationSetProperties(destination,[kCGImagePropertyGIFDictionary:
+        [kCGImagePropertyGIFLoopCount:0]] as CFDictionary)
+    for frame in 0..<48 {
+        autoreleasepool {
+            let image = previewImage(time:Double(frame)/10)
+            let bitmap = NSBitmapImageRep(data:image.tiffRepresentation!)!
+            CGImageDestinationAddImage(destination,bitmap.cgImage!,[kCGImagePropertyGIFDictionary:
+                [kCGImagePropertyGIFDelayTime:0.1]] as CFDictionary)
+        }
+    }
+    precondition(CGImageDestinationFinalize(destination))
+}
+
 let app = NSApplication.shared
 if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--render-preview" {
     renderPreview(CommandLine.arguments[2])
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--render-animation" {
+    renderAnimation(CommandLine.arguments[2])
 } else if CommandLine.arguments.contains("--smoke-test") {
     guard ProcessInfo.processInfo.environment["CODEX_WORKERS_DATA"] != nil else {
         fatalError("Set CODEX_WORKERS_DATA to an isolated test directory")
